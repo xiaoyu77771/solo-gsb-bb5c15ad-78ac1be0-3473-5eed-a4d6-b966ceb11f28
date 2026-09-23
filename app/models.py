@@ -61,6 +61,15 @@ class SessionCreate(BaseModel):
         le=10_000,
         description="单题全局曝光上限；缺省取服务端 DEFAULT_EXPOSURE_LIMIT",
     )
+    duration_seconds: int | None = Field(
+        None,
+        ge=60,
+        le=86_400,
+        description=(
+            "可选测验时限（秒，60~86400）；"
+            "服务端按 UTC 记录截止时间，到期后 /next 与提交答案返回 409"
+        ),
+    )
 
 
 class SessionOut(BaseModel):
@@ -69,6 +78,8 @@ class SessionOut(BaseModel):
     current_item_id: str | None
     max_items: int
     exposure_limit: int
+    duration_seconds: int | None = None
+    expires_at: str | None = None
     status: str
     finish_reason: str | None
     answered_count: int
@@ -138,6 +149,8 @@ class ProgressOut(BaseModel):
     bank_size: int
     percent_complete: float
     exposure_limit: int
+    duration_seconds: int | None = None
+    expires_at: str | None = None
     finish_reason: str | None
     current_item: ItemOut | None
     answered_item_ids: list[str]

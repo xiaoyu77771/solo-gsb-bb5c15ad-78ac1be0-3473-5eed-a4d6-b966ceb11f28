@@ -6,6 +6,7 @@
 - 考生提交答案后，服务端用**一次 Newton-Raphson 更新**估计能力值 `θ`；
 - 下一题在满足**曝光上限**的候选题中，按 **Fisher 信息量最大**选择，信息量并列时取**最小（稳定的）题目 ID**；
 - `response_id` 为客户端幂等键：**重复提交返回首次结果，不重复更新能力值、不重复计曝光**；
+- 支持可选测验时限 `duration_seconds`（60～86400 秒）：创建时按 UTC 记录截止时间 `expires_at`，到期后取题/作答原子结束会话并返回 `409`；
 - 提供会话进度查询与完整答题记录查询；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
@@ -58,7 +59,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 python examples/demo.py
 ```
 
-脚本会：创建会话 → 循环「取题 → 作答」5 轮 → 演示重复 `response_id` 幂等、重复 `/next` 不重复计曝光 → 打印进度与答题记录。
+脚本会：创建带 600 秒时限的会话（演示 `duration_seconds` 越界校验与 `expires_at`）→ 循环「取题 → 作答」5 轮 → 演示重复 `response_id` 幂等、重复 `/next` 不重复计曝光 → 打印进度与答题记录。
 
 ## 核心算法
 
@@ -96,6 +97,17 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 - 若存在「已取出但未作答」的挂起题，重复调 `/next` 返回**同一题且不重复加曝光**；
 - 已答满 `max_items` → 会话结束，`finish_reason = max_items`；
 - 没有满足曝光上限的候选题 → 结束，`finish_reason = no_available_items`。
+
+### 测验时限（可选 `duration_seconds`）
+
+- 创建会话时可传 `duration_seconds`，取值 **60～86400 秒**；不传则无时限（行为与旧版一致）。
+- 服务端在创建时按 **UTC** 计算并持久化截止时间 `expires_at = created_at + duration_seconds`
+  （ISO-8601，秒级），在创建响应以及 `GET /api/sessions/{id}`、`/progress` 中一并返回。
+- `POST /next` 与 `POST /responses` 在**写事务内最先检查**截止时间：一旦 `now(UTC) >= expires_at`，
+  即在同一事务内原子地把会话置为 `finished`、`finish_reason = time_expired`、清空挂起题，
+  并以 **HTTP 409** 拒绝本次操作；**不会**增加任何曝光计数，也**不会**写入答题记录。
+  未到期时完全保留原有行为（包括挂起题不重复计曝光、`response_id` 幂等）。
+- 只读的会话/进度/记录查询不触发自动结束；客户端可据 `expires_at` 自行倒计时。
 
 ### 幂等作答（`POST /api/sessions/{id}/responses`）
 
@@ -138,25 +150,37 @@ curl -s -X POST http://localhost:8000/api/sessions \
   -d '{"initial_theta": 0.0, "max_items": 10, "exposure_limit": 5}'
 # 记下返回的 "id"，导出 SID=...
 
+# 2b) 也可以在创建时指定测验时限（秒，60~86400）；
+#     返回中会带 UTC 截止时间 "expires_at"
+curl -s -X POST http://localhost:8000/api/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"initial_theta": 0.0, "max_items": 10, "duration_seconds": 600}'
+# {"id":"...", "duration_seconds":600,
+#  "expires_at":"2026-09-23T08:10:00+00:00", "status":"active", ...}
+
 # 3) 选下一题
 curl -s -X POST http://localhost:8000/api/sessions/$SID/next
 # item.id / item.stem / item.options / information / exposure_count ...
+# 若已过 expires_at：HTTP 409，
+# {"detail":"测验时限已到（UTC 截止时间 ...），会话已结束：finish_reason=time_expired"}
 
 # 4) 提交答案（response_id 为客户端幂等键，务必唯一）
 curl -s -X POST http://localhost:8000/api/sessions/$SID/responses \
   -H 'Content-Type: application/json' \
   -d '{"response_id": "'$(uuidgen)'", "item_id": "ITEM-xxx", "response": "A"}'
 # 返回 correct、score、theta_before、theta_after、p_correct ...
+# 到期后提交同样返回 409，且不写入答题记录、不增加曝光
 
 # 5) 用完全相同的请求体重放一次 -> 返回首次结果，theta_after 不变
 
-# 6) 查询会话进度与答题记录
+# 6) 查询会话（含 expires_at）、进度与答题记录
+curl -s http://localhost:8000/api/sessions/$SID
 curl -s http://localhost:8000/api/sessions/$SID/progress
 curl -s http://localhost:8000/api/sessions/$SID/responses
 ```
 
 重复步骤 3-4 即可完成整场测验；当 `status` 变为 `finished` 时，可从
-`finish_reason` 得知结束原因（`max_items` / `no_available_items`）。
+`finish_reason` 得知结束原因（`max_items` / `no_available_items` / `time_expired`）。
 
 ## 环境变量
 

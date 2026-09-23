@@ -20,7 +20,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -80,6 +80,63 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def parse_utc(value: str) -> datetime:
+    """Parse a stored ISO-8601 UTC timestamp into an aware datetime."""
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:  # defensive: timestamps are always written as UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def expire_if_due(
+    conn: sqlite3.Connection,
+    session: sqlite3.Row,
+    now: datetime,
+) -> sqlite3.Row | None:
+    """Finish an active session whose deadline has passed.
+
+    Must be called first thing inside a serialised write transaction.  When
+    the session has an ``expires_at`` in the past it is marked finished with
+    ``finish_reason = 'time_expired'`` and the pending item is cleared; the
+    pending item does *not* get another exposure (selection already counted
+    one) and no response row is written.
+
+    The finishing UPDATE is committed immediately (still inside the same
+    serialised transaction, before any other write) and the connection is
+    returned to autocommit mode, so the caller can raise the 409 without the
+    surrounding ``transaction()`` rolling the expiry back.  Returns the
+    refreshed row when the session was expired, otherwise ``None``.
+    """
+    if session["status"] != "active" or session["expires_at"] is None:
+        return None
+    expires_at = parse_utc(session["expires_at"])
+    if now < expires_at:
+        return None
+    conn.execute(
+        """UPDATE sessions
+           SET status = 'finished', finish_reason = 'time_expired',
+               current_item_id = NULL, updated_at = ?
+           WHERE id = ? AND status = 'active'""",
+        (now.isoformat(timespec="seconds"), session["id"]),
+    )
+    row = conn.execute(
+        "SELECT * FROM sessions WHERE id = ?", (session["id"],)
+    ).fetchone()
+    conn.commit()
+    return row
+
+
+def time_expired_409(expired: sqlite3.Row) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=(
+            "测验时限已到（UTC 截止时间 "
+            f"{expired['expires_at']}），会话已结束："
+            "finish_reason=time_expired"
+        ),
+    )
+
+
 def get_session_or_404(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row:
     row = conn.execute(
         "SELECT * FROM sessions WHERE id = ?", (session_id,)
@@ -129,6 +186,8 @@ def serialize_session(row: sqlite3.Row, n_answered: int) -> SessionOut:
         current_item_id=row["current_item_id"],
         max_items=row["max_items"],
         exposure_limit=row["exposure_limit"],
+        duration_seconds=row["duration_seconds"],
+        expires_at=row["expires_at"],
         status=row["status"],
         finish_reason=row["finish_reason"],
         answered_count=n_answered,
@@ -215,20 +274,30 @@ def create_session(
     body: SessionCreate, conn: sqlite3.Connection = Depends(get_db)
 ) -> SessionOut:
     session_id = uuid.uuid4().hex
-    now = utc_now()
+    created = datetime.now(timezone.utc)
+    now = created.isoformat(timespec="seconds")
+    duration = body.duration_seconds
+    expires_at = (
+        (created + timedelta(seconds=duration)).isoformat(timespec="seconds")
+        if duration is not None
+        else None
+    )
     with transaction(conn):
         conn.execute(
             """
             INSERT INTO sessions
                 (id, theta, current_item_id, max_items, exposure_limit,
+                 duration_seconds, expires_at,
                  status, finish_reason, created_at, updated_at)
-            VALUES (?, ?, NULL, ?, ?, 'active', NULL, ?, ?)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, 'active', NULL, ?, ?)
             """,
             (
                 session_id,
                 body.initial_theta,
                 body.max_items,
                 body.exposure_limit or DEFAULT_EXPOSURE_LIMIT,
+                duration,
+                expires_at,
                 now,
                 now,
             ),
@@ -279,6 +348,8 @@ def session_progress(
         bank_size=bank_size,
         percent_complete=round(n_answered / session["max_items"] * 100, 1),
         exposure_limit=session["exposure_limit"],
+        duration_seconds=session["duration_seconds"],
+        expires_at=session["expires_at"],
         finish_reason=session["finish_reason"],
         current_item=current_item,
         answered_item_ids=answered_ids,
@@ -330,6 +401,11 @@ def next_item(
     write transaction.  That way a burst of concurrent calls on the same
     session is linearised: the first selects and counts one exposure, every
     later call finds the pending item and returns it unchanged.
+
+    If the session has a ``duration_seconds`` limit whose UTC ``expires_at``
+    has passed, the session is first atomically finished
+    (``finish_reason = 'time_expired'``) with its pending item cleared, and
+    the request is rejected with 409; no exposure is added.
     """
     outcome: dict
 
@@ -339,6 +415,13 @@ def next_item(
         ).fetchone()
         if session is None:
             raise HTTPException(status_code=404, detail="session not found")
+
+        # Case 0: the time limit has elapsed -> finish atomically and reject
+        # the call with 409.  No item is selected (no new exposure) and no
+        # response row is written; any pending item is cleared.
+        expired = expire_if_due(conn, session, datetime.now(timezone.utc))
+        if expired is not None:
+            raise time_expired_409(expired)
 
         n_answered = answered_count(conn, session_id)
         now = utc_now()
@@ -504,8 +587,12 @@ def submit_response(
     """Score one answer and apply exactly one Newton update.
 
     Idempotency contract: the client-generated ``response_id`` is the
-    dedupe key.  The lookup is the *first* statement inside the serialised
-    write transaction, so even a burst of concurrent retries observes the
+    dedupe key.  The deadline check is the *first* statement inside the
+    serialised write transaction: once ``expires_at`` has passed the session
+    is atomically finished (``time_expired``) with its pending item cleared,
+    and the call is rejected with 409 — no exposure is added and no response
+    row is written.  Afterwards the idempotency lookup is checked under the
+    same write lock, so even a burst of concurrent retries observes the
     first committed record and is replayed (HTTP 200) instead of being
     scored a second time.
     """
@@ -514,7 +601,19 @@ def submit_response(
     replay = False
 
     with transaction(conn):
-        # 1) Idempotency replay, checked after acquiring the write lock.
+        # 1) Deadline check, first inside the serialised write transaction:
+        #    expiry finishes the session atomically and rejects the call;
+        #    nothing else (exposure, response row) is written.
+        session = conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        expired = expire_if_due(conn, session, datetime.now(timezone.utc))
+        if expired is not None:
+            raise time_expired_409(expired)
+
+        # 2) Idempotency replay, checked after acquiring the write lock.
         existing = conn.execute(
             "SELECT * FROM responses WHERE id = ?", (body.response_id,)
         ).fetchone()
@@ -526,12 +625,8 @@ def submit_response(
                 )
             stored_row, replay = existing, True
         else:
-            # 2) Validate session / pending item state.
-            session = conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
-            ).fetchone()
-            if session is None:
-                raise HTTPException(status_code=404, detail="session not found")
+            # 3) Validate the pending item state (existence, deadline and
+            #    finished status have already been checked above).
             if session["status"] == "finished":
                 raise HTTPException(status_code=409, detail="测验已结束")
             if session["current_item_id"] != body.item_id:
@@ -558,7 +653,7 @@ def submit_response(
                     detail=f"无效作答选项：{body.response!r}，可选 {sorted(option_keys)}",
                 )
 
-            # 3) Score and apply exactly one Newton-Raphson update.
+            # 4) Score and apply exactly one Newton-Raphson update.
             score = 1 if response_key == item["answer"] else 0
             theta_before = session["theta"]
             theta_after, p_correct, _, info = irt.newton_step(
@@ -608,7 +703,7 @@ def submit_response(
                 else:
                     raise HTTPException(status_code=409, detail="重复作答冲突")
             else:
-                # 4) Advance session state; finish eagerly at max_items.
+                # 5) Advance session state; finish eagerly at max_items.
                 conn.execute(
                     """UPDATE sessions
                        SET theta = ?, current_item_id = NULL, updated_at = ?

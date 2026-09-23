@@ -4,9 +4,10 @@ Run with the API already listening on http://127.0.0.1:8000:
 
     python examples/demo.py
 
-It creates a session, runs a mini adaptive quiz, demonstrates idempotent
-retry with a repeated response_id, shows /next de-duplication and prints
-session progress and the answer history.
+It creates a time-limited session, runs a mini adaptive quiz, demonstrates
+idempotent retry with a repeated response_id, shows /next de-duplication,
+prints session progress and the answer history, and demonstrates the
+duration_seconds validation (60..86400).
 """
 
 from __future__ import annotations
@@ -32,6 +33,22 @@ def call(method: str, path: str, payload: dict | None = None) -> dict:
         return json.loads(resp.read())
 
 
+def expect_http_error(method: str, path: str, payload: dict) -> None:
+    """Show that a request is rejected (used for duration validation)."""
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        BASE_URL + path, data=data,
+        headers={"Content-Type": "application/json"}, method=method,
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as exc:
+        body = json.loads(exc.read().decode())
+        print(f"  -> 被拒绝 HTTP {exc.code}: {json.dumps(body['detail'], ensure_ascii=False)}")
+    else:
+        raise AssertionError("应当被服务端拒绝")
+
+
 def show(label: str, obj: object) -> None:
     print(f"\n=== {label} ===")
     print(json.dumps(obj, ensure_ascii=False, indent=2))
@@ -41,12 +58,24 @@ def main() -> None:
     health = call("GET", "/health")
     show("GET /health", health)
 
+    # duration_seconds 必须在 60..86400 之间；越界由 Pydantic 以 422 拒绝。
+    expect_http_error(
+        "POST", "/api/sessions",
+        {"initial_theta": 0.0, "max_items": 8, "duration_seconds": 30},
+    )
+
+    # 本场测验限时 600 秒；响应中 duration_seconds 与 UTC expires_at 均会返回。
     session = call(
         "POST", "/api/sessions",
-        {"initial_theta": 0.0, "max_items": 8, "exposure_limit": 5},
+        {"initial_theta": 0.0, "max_items": 8, "exposure_limit": 5,
+         "duration_seconds": 600},
     )
     sid = session["id"]
     show("POST /api/sessions", session)
+    assert session["duration_seconds"] == 600
+    assert session["expires_at"], "设置时限后应返回 UTC 截止时间"
+    print(f"  -> 时限 600 秒，UTC 截止时间 expires_at = {session['expires_at']}")
+    print("  -> 到期后 /next 与提交答案会返回 409，会话置为 finished(time_expired)")
 
     rng = random.Random(7)
     theta = session["theta"]
@@ -117,6 +146,8 @@ def main() -> None:
         "theta": round(progress["theta"], 4),
         "answered_count": progress["answered_count"],
         "percent_complete": progress["percent_complete"],
+        "duration_seconds": progress["duration_seconds"],
+        "expires_at": progress["expires_at"],
         "answered_item_ids": progress["answered_item_ids"],
         "current_item": (progress["current_item"] or {}).get("id"),
     })

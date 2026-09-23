@@ -26,16 +26,18 @@ CREATE TABLE IF NOT EXISTS items (
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id              TEXT PRIMARY KEY,
-    theta           REAL NOT NULL,
-    current_item_id TEXT REFERENCES items(id), -- item currently served, not yet answered
-    max_items       INTEGER NOT NULL,
-    exposure_limit  INTEGER NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'active'
-                    CHECK (status IN ('active', 'finished')),
-    finish_reason   TEXT, -- 'max_items' | 'no_available_items'
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
+    id               TEXT PRIMARY KEY,
+    theta            REAL NOT NULL,
+    current_item_id  TEXT REFERENCES items(id), -- item currently served, not yet answered
+    max_items        INTEGER NOT NULL,
+    exposure_limit   INTEGER NOT NULL,
+    duration_seconds INTEGER, -- optional time limit in seconds (60..86400); NULL = no limit
+    expires_at       TEXT,    -- UTC ISO-8601 deadline (created_at + duration_seconds)
+    status           TEXT NOT NULL DEFAULT 'active'
+                     CHECK (status IN ('active', 'finished')),
+    finish_reason    TEXT, -- 'max_items' | 'no_available_items' | 'time_expired'
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS responses (
@@ -78,12 +80,22 @@ def get_db() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, decl: str) -> None:
+    """Add a column to an existing table if it is missing (idempotent)."""
+    columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if name not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def init_db() -> None:
     """Create tables (idempotent) and seed a deterministic demo bank once."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(DB_PATH)) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        # Migrate databases created before the optional session time limit.
+        _ensure_column(conn, "sessions", "duration_seconds", "INTEGER")
+        _ensure_column(conn, "sessions", "expires_at", "TEXT")
         count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         if count == 0:
             conn.executemany(
