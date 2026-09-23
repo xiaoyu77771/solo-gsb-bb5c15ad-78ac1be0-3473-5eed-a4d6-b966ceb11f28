@@ -4,9 +4,14 @@ Run with the API already listening on http://127.0.0.1:8000:
 
     python examples/demo.py
 
-It creates a session, runs a mini adaptive quiz, demonstrates idempotent
-retry with a repeated response_id, shows /next de-duplication and prints
-session progress and the answer history.
+It creates a timed session (10-minute limit), runs a mini adaptive quiz,
+demonstrates idempotent retry with a repeated response_id, shows /next
+de-duplication and prints session progress and the answer history.
+
+Once a session passes its UTC ``expires_at`` deadline, POST .../next and
+POST .../responses finish the session (finish_reason="time_expired"),
+clear the pending item and reply with HTTP 409; neither the item exposure
+count nor the response history is changed.
 """
 
 from __future__ import annotations
@@ -43,10 +48,23 @@ def main() -> None:
 
     session = call(
         "POST", "/api/sessions",
-        {"initial_theta": 0.0, "max_items": 8, "exposure_limit": 5},
+        {
+            "initial_theta": 0.0,
+            "max_items": 8,
+            "exposure_limit": 5,
+            "duration_seconds": 600,  # 10-minute time limit (60~86400)
+        },
     )
     sid = session["id"]
-    show("POST /api/sessions", session)
+    show(
+        "POST /api/sessions",
+        {
+            "id": session["id"],
+            "status": session["status"],
+            "duration_seconds": session["duration_seconds"],
+            "expires_at": session["expires_at"],  # UTC deadline, ISO-8601
+        },
+    )
 
     rng = random.Random(7)
     theta = session["theta"]

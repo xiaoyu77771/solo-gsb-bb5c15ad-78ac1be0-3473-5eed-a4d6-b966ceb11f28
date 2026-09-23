@@ -6,6 +6,9 @@
 - 考生提交答案后，服务端用**一次 Newton-Raphson 更新**估计能力值 `θ`；
 - 下一题在满足**曝光上限**的候选题中，按 **Fisher 信息量最大**选择，信息量并列时取**最小（稳定的）题目 ID**；
 - `response_id` 为客户端幂等键：**重复提交返回首次结果，不重复更新能力值、不重复计曝光**；
+- 创建会话时可选 `duration_seconds` 测验时限（60～86400 秒），服务端按 UTC
+  记录截止时间 `expires_at`；到期后 `/next` 与提交答案会原子结束会话
+  （`finish_reason = time_expired`）、清空挂起题并以 **409** 拒绝，不增加曝光、不写答题记录；
 - 提供会话进度查询与完整答题记录查询；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
@@ -97,6 +100,22 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 - 已答满 `max_items` → 会话结束，`finish_reason = max_items`；
 - 没有满足曝光上限的候选题 → 结束，`finish_reason = no_available_items`。
 
+### 测验时限（可选）
+
+创建会话时可传 `duration_seconds`（整数，60～86400 秒，即 1 分钟～1 天）：
+
+- 服务端在创建事务内按 **UTC** 计算并保存截止时间 `expires_at`（ISO-8601），
+  并在创建响应与 `GET /api/sessions/{id}` 中原样返回（不传时限时
+  `duration_seconds` 与 `expires_at` 均为 `null`，行为与旧版完全一致）；
+- `/next` 与提交答案接口会在 `BEGIN IMMEDIATE` 写事务内**先**比较当前 UTC 时间
+  与 `expires_at`：一旦到期，原子地把会话置为 `finished`、
+  `finish_reason = time_expired`、清空挂起题 `current_item_id`，随后以
+  **HTTP 409** 拒绝本次操作；
+- 到期拒绝发生在任何选题/评分逻辑之前，因此**不会增加题目曝光计数，也不会写入
+  答题记录**；挂起题此前已计的曝光予以保留；
+- 时限检查是惰性的（由 `/next` 或提交答案触发）：会话在查询接口中可能在到期
+  之后、下一次写操作之前仍短暂显示 `active`，这属于预期行为。
+
 ### 幂等作答（`POST /api/sessions/{id}/responses`）
 
 - 客户端为每次作答生成唯一 `response_id`（建议 UUID），与请求体一起提交；
@@ -137,6 +156,17 @@ curl -s -X POST http://localhost:8000/api/sessions \
   -H 'Content-Type: application/json' \
   -d '{"initial_theta": 0.0, "max_items": 10, "exposure_limit": 5}'
 # 记下返回的 "id"，导出 SID=...
+# 不传 duration_seconds 时 "duration_seconds": null、"expires_at": null（不限时）
+
+# 2b) 创建一个 10 分钟限时会话（60~86400 秒；expires_at 按 UTC 记录）
+curl -s -X POST http://localhost:8000/api/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"initial_theta": 0.0, "max_items": 10, "duration_seconds": 600}'
+# {"id":"...", "duration_seconds":600,
+#  "expires_at":"2026-09-23T08:10:00+00:00", "status":"active", ...}
+
+# 2c) 查询会话状态（返回同样包含 duration_seconds / expires_at）
+curl -s http://localhost:8000/api/sessions/$SID
 
 # 3) 选下一题
 curl -s -X POST http://localhost:8000/api/sessions/$SID/next
@@ -155,8 +185,34 @@ curl -s http://localhost:8000/api/sessions/$SID/progress
 curl -s http://localhost:8000/api/sessions/$SID/responses
 ```
 
+限时会话一旦超过 `expires_at`，步骤 3/4 都会以 **409** 结束：
+
+```json
+{"detail": "测验已超过时限：会话已结束（finish_reason=time_expired）"}
+```
+
+此时再查会话可见 `status = "finished"`、`finish_reason = "time_expired"`、
+`current_item_id = null`；题库曝光数与答题记录均不发生变化。
+
 重复步骤 3-4 即可完成整场测验；当 `status` 变为 `finished` 时，可从
-`finish_reason` 得知结束原因（`max_items` / `no_available_items`）。
+`finish_reason` 得知结束原因（`max_items` / `no_available_items` /
+`time_expired`）。
+
+## 数据模型：会话字段
+
+`POST /api/sessions` 的请求体：
+
+| 字段 | 类型 | 范围/默认 | 说明 |
+| --- | --- | --- | --- |
+| `initial_theta` | number | `[-6, 6]`，默认 `0.0` | 初始能力值 |
+| `max_items` | integer | `1~50`，默认 `10` | 本次最多作答题数 |
+| `exposure_limit` | integer \| null | `1~10000`，缺省取 `DEFAULT_EXPOSURE_LIMIT` | 单题全局曝光上限 |
+| `duration_seconds` | integer \| null | `60~86400`，缺省 `null` | 可选测验时限（秒） |
+
+会话响应（创建与 `GET /api/sessions/{id}`）在上述字段之外还包含：
+`id`、`theta`、`current_item_id`、`status`、`finish_reason`、`answered_count`、
+`created_at`、`updated_at`，以及时限相关的 **`duration_seconds`**（秒，不限时为
+`null`）与 **`expires_at`**（UTC ISO-8601 截止时间，不限时为 `null`）。
 
 ## 环境变量
 

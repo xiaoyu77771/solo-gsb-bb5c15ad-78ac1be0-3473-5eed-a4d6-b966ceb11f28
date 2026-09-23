@@ -31,9 +31,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     current_item_id TEXT REFERENCES items(id), -- item currently served, not yet answered
     max_items       INTEGER NOT NULL,
     exposure_limit  INTEGER NOT NULL,
+    duration_seconds INTEGER,                 -- optional time limit in seconds; NULL = untimed
+    expires_at      TEXT,                     -- UTC ISO-8601 deadline; NULL = untimed
     status          TEXT NOT NULL DEFAULT 'active'
                     CHECK (status IN ('active', 'finished')),
-    finish_reason   TEXT, -- 'max_items' | 'no_available_items'
+    finish_reason   TEXT, -- 'max_items' | 'no_available_items' | 'time_expired'
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -78,12 +80,22 @@ def get_db() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the first release to pre-existing DBs."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "duration_seconds" not in columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN duration_seconds INTEGER")
+    if "expires_at" not in columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN expires_at TEXT")
+
+
 def init_db() -> None:
     """Create tables (idempotent) and seed a deterministic demo bank once."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(DB_PATH)) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        _migrate(conn)
         count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         if count == 0:
             conn.executemany(

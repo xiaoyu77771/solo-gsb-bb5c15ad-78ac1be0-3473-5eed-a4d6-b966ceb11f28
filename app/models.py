@@ -61,6 +61,13 @@ class SessionCreate(BaseModel):
         le=10_000,
         description="单题全局曝光上限；缺省取服务端 DEFAULT_EXPOSURE_LIMIT",
     )
+    duration_seconds: int | None = Field(
+        None,
+        ge=60,
+        le=86_400,
+        description="可选测验时限（秒，60~86400）；缺省表示不限时。"
+        "服务端按 UTC 记录 expires_at，到期后 /next 与作答返回 409",
+    )
 
 
 class SessionOut(BaseModel):
@@ -69,6 +76,8 @@ class SessionOut(BaseModel):
     current_item_id: str | None
     max_items: int
     exposure_limit: int
+    duration_seconds: int | None
+    expires_at: str | None
     status: str
     finish_reason: str | None
     answered_count: int

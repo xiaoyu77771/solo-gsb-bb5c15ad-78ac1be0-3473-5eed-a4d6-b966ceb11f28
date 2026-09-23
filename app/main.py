@@ -20,7 +20,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -80,6 +80,36 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def parse_ts(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp; treat a naive value as UTC."""
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def finish_session_expired(
+    conn: sqlite3.Connection, session: sqlite3.Row, now: datetime
+) -> bool:
+    """If a timed, still-active session is past its deadline, finish it.
+
+    Runs inside a ``BEGIN IMMEDIATE`` transaction: the check and the state
+    change are atomic.  The pending item is cleared and no answer row is
+    written.  Returns ``True`` when this call finished the session.
+    """
+    expires_at = session["expires_at"]
+    if expires_at is None or session["status"] != "active":
+        return False
+    if now < parse_ts(expires_at):
+        return False
+    conn.execute(
+        """UPDATE sessions
+           SET status = 'finished', finish_reason = 'time_expired',
+               current_item_id = NULL, updated_at = ?
+           WHERE id = ? AND status = 'active'""",
+        (now.isoformat(timespec="seconds"), session["id"]),
+    )
+    return True
+
+
 def get_session_or_404(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row:
     row = conn.execute(
         "SELECT * FROM sessions WHERE id = ?", (session_id,)
@@ -129,6 +159,8 @@ def serialize_session(row: sqlite3.Row, n_answered: int) -> SessionOut:
         current_item_id=row["current_item_id"],
         max_items=row["max_items"],
         exposure_limit=row["exposure_limit"],
+        duration_seconds=row["duration_seconds"],
+        expires_at=row["expires_at"],
         status=row["status"],
         finish_reason=row["finish_reason"],
         answered_count=n_answered,
@@ -215,20 +247,31 @@ def create_session(
     body: SessionCreate, conn: sqlite3.Connection = Depends(get_db)
 ) -> SessionOut:
     session_id = uuid.uuid4().hex
-    now = utc_now()
+    created = datetime.now(timezone.utc)
+    now = created.isoformat(timespec="seconds")
+    expires_at = (
+        (created + timedelta(seconds=body.duration_seconds)).isoformat(
+            timespec="seconds"
+        )
+        if body.duration_seconds is not None
+        else None
+    )
     with transaction(conn):
         conn.execute(
             """
             INSERT INTO sessions
                 (id, theta, current_item_id, max_items, exposure_limit,
+                 duration_seconds, expires_at,
                  status, finish_reason, created_at, updated_at)
-            VALUES (?, ?, NULL, ?, ?, 'active', NULL, ?, ?)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, 'active', NULL, ?, ?)
             """,
             (
                 session_id,
                 body.initial_theta,
                 body.max_items,
                 body.exposure_limit or DEFAULT_EXPOSURE_LIMIT,
+                body.duration_seconds,
+                expires_at,
                 now,
                 now,
             ),
@@ -330,8 +373,14 @@ def next_item(
     write transaction.  That way a burst of concurrent calls on the same
     session is linearised: the first selects and counts one exposure, every
     later call finds the pending item and returns it unchanged.
+
+    If the session's ``expires_at`` deadline has passed, the transaction
+    finishes the session (``finish_reason = time_expired``), clears the
+    pending item and the request is rejected with 409: no exposure is
+    counted.
     """
     outcome: dict
+    expired = False
 
     with transaction(conn):
         session = conn.execute(
@@ -341,81 +390,52 @@ def next_item(
             raise HTTPException(status_code=404, detail="session not found")
 
         n_answered = answered_count(conn, session_id)
-        now = utc_now()
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
 
-        # Case 1: a served, unanswered item is pending -> return it as-is.
-        if session["current_item_id"]:
-            item_row = conn.execute(
-                "SELECT * FROM items WHERE id = ?", (session["current_item_id"],)
-            ).fetchone()
-            outcome = {
-                "status": session["status"],
-                "item_row": item_row,
-                "information": irt.information(
-                    session["theta"],
-                    item_row["discrimination"],
-                    item_row["difficulty"],
-                ) if item_row is not None else None,
-                "exposure_limit": session["exposure_limit"],
-                "answered_count": n_answered,
-                "max_items": session["max_items"],
-                "finish_reason": session["finish_reason"],
-                "note": "pending_item: 该题尚未作答，重复请求不重复计曝光",
-            }
-
-        # Case 2: session already finished.
-        elif session["status"] == "finished":
-            outcome = {
-                "status": "finished",
-                "item_row": None,
-                "information": None,
-                "exposure_limit": session["exposure_limit"],
-                "answered_count": n_answered,
-                "max_items": session["max_items"],
-                "finish_reason": session["finish_reason"],
-                "note": "测验已结束",
-            }
-
-        # Case 3: item quota reached -> finish eagerly.
-        elif n_answered >= session["max_items"]:
-            conn.execute(
-                """UPDATE sessions
-                   SET status = 'finished', finish_reason = 'max_items',
-                       updated_at = ?
-                   WHERE id = ?""",
-                (now, session_id),
-            )
-            outcome = {
-                "status": "finished",
-                "item_row": None,
-                "information": None,
-                "exposure_limit": session["exposure_limit"],
-                "answered_count": n_answered,
-                "max_items": session["max_items"],
-                "finish_reason": "max_items",
-                "note": "已达到最大题量",
-            }
-
+        # Case 0: the time limit elapsed -> finish atomically and reject.
+        # No exposure is counted and no answer row is written.
+        if finish_session_expired(conn, session, now_dt):
+            expired = True
         else:
-            # Candidate read under the write lock: exposure counts seen here
-            # cannot change before we update them.
-            candidates = conn.execute(
-                """
-                SELECT * FROM items
-                WHERE exposure_count < ?
-                  AND id NOT IN (
-                      SELECT item_id FROM responses WHERE session_id = ?
-                  )
-                """,
-                (session["exposure_limit"], session_id),
-            ).fetchall()
+            # Case 1: a served, unanswered item is pending -> return it as-is.
+            if session["current_item_id"]:
+                item_row = conn.execute(
+                    "SELECT * FROM items WHERE id = ?", (session["current_item_id"],)
+                ).fetchone()
+                outcome = {
+                    "status": session["status"],
+                    "item_row": item_row,
+                    "information": irt.information(
+                        session["theta"],
+                        item_row["discrimination"],
+                        item_row["difficulty"],
+                    ) if item_row is not None else None,
+                    "exposure_limit": session["exposure_limit"],
+                    "answered_count": n_answered,
+                    "max_items": session["max_items"],
+                    "finish_reason": session["finish_reason"],
+                    "note": "pending_item: 该题尚未作答，重复请求不重复计曝光",
+                }
 
-            # Case 4: no eligible item left -> finish.
-            if not candidates:
+            # Case 2: session already finished.
+            elif session["status"] == "finished":
+                outcome = {
+                    "status": "finished",
+                    "item_row": None,
+                    "information": None,
+                    "exposure_limit": session["exposure_limit"],
+                    "answered_count": n_answered,
+                    "max_items": session["max_items"],
+                    "finish_reason": session["finish_reason"],
+                    "note": "测验已结束",
+                }
+
+            # Case 3: item quota reached -> finish eagerly.
+            elif n_answered >= session["max_items"]:
                 conn.execute(
                     """UPDATE sessions
-                       SET status = 'finished',
-                           finish_reason = 'no_available_items',
+                       SET status = 'finished', finish_reason = 'max_items',
                            updated_at = ?
                        WHERE id = ?""",
                     (now, session_id),
@@ -427,49 +447,90 @@ def next_item(
                     "exposure_limit": session["exposure_limit"],
                     "answered_count": n_answered,
                     "max_items": session["max_items"],
-                    "finish_reason": "no_available_items",
-                    "note": "没有满足曝光上限的候选题",
+                    "finish_reason": "max_items",
+                    "note": "已达到最大题量",
                 }
 
-            # Case 5: select the maximum-information item (id tie-break),
-            # count exactly one exposure and mark it pending atomically.
             else:
-                theta = session["theta"]
-                best = min(
-                    candidates,
-                    key=lambda r: (
-                        -irt.information(
-                            theta, r["discrimination"], r["difficulty"]
+                # Candidate read under the write lock: exposure counts seen here
+                # cannot change before we update them.
+                candidates = conn.execute(
+                    """
+                    SELECT * FROM items
+                    WHERE exposure_count < ?
+                      AND id NOT IN (
+                          SELECT item_id FROM responses WHERE session_id = ?
+                      )
+                    """,
+                    (session["exposure_limit"], session_id),
+                ).fetchall()
+
+                # Case 4: no eligible item left -> finish.
+                if not candidates:
+                    conn.execute(
+                        """UPDATE sessions
+                           SET status = 'finished',
+                               finish_reason = 'no_available_items',
+                               updated_at = ?
+                           WHERE id = ?""",
+                        (now, session_id),
+                    )
+                    outcome = {
+                        "status": "finished",
+                        "item_row": None,
+                        "information": None,
+                        "exposure_limit": session["exposure_limit"],
+                        "answered_count": n_answered,
+                        "max_items": session["max_items"],
+                        "finish_reason": "no_available_items",
+                        "note": "没有满足曝光上限的候选题",
+                    }
+
+                # Case 5: select the maximum-information item (id tie-break),
+                # count exactly one exposure and mark it pending atomically.
+                else:
+                    theta = session["theta"]
+                    best = min(
+                        candidates,
+                        key=lambda r: (
+                            -irt.information(
+                                theta, r["discrimination"], r["difficulty"]
+                            ),
+                            r["id"],
                         ),
-                        r["id"],
-                    ),
-                )
-                info = irt.information(
-                    theta, best["discrimination"], best["difficulty"]
-                )
-                conn.execute(
-                    "UPDATE items SET exposure_count = exposure_count + 1 "
-                    "WHERE id = ?",
-                    (best["id"],),
-                )
-                conn.execute(
-                    "UPDATE sessions SET current_item_id = ?, updated_at = ? "
-                    "WHERE id = ?",
-                    (best["id"], now, session_id),
-                )
-                item_row = conn.execute(
-                    "SELECT * FROM items WHERE id = ?", (best["id"],)
-                ).fetchone()
-                outcome = {
-                    "status": "active",
-                    "item_row": item_row,
-                    "information": info,
-                    "exposure_limit": session["exposure_limit"],
-                    "answered_count": n_answered,
-                    "max_items": session["max_items"],
-                    "finish_reason": None,
-                    "note": None,
-                }
+                    )
+                    info = irt.information(
+                        theta, best["discrimination"], best["difficulty"]
+                    )
+                    conn.execute(
+                        "UPDATE items SET exposure_count = exposure_count + 1 "
+                        "WHERE id = ?",
+                        (best["id"],),
+                    )
+                    conn.execute(
+                        "UPDATE sessions SET current_item_id = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (best["id"], now, session_id),
+                    )
+                    item_row = conn.execute(
+                        "SELECT * FROM items WHERE id = ?", (best["id"],)
+                    ).fetchone()
+                    outcome = {
+                        "status": "active",
+                        "item_row": item_row,
+                        "information": info,
+                        "exposure_limit": session["exposure_limit"],
+                        "answered_count": n_answered,
+                        "max_items": session["max_items"],
+                        "finish_reason": None,
+                        "note": None,
+                    }
+
+    if expired:
+        raise HTTPException(
+            status_code=409,
+            detail="测验已超过时限：会话已结束（finish_reason=time_expired）",
+        )
 
     item_row = outcome["item_row"]
     return NextItemOut(
@@ -508,6 +569,12 @@ def submit_response(
     write transaction, so even a burst of concurrent retries observes the
     first committed record and is replayed (HTTP 200) instead of being
     scored a second time.
+
+    For a genuinely new answer, the session deadline is checked next inside
+    the same write lock: once ``expires_at`` has passed the session is
+    finished (``finish_reason = time_expired``), the pending item is cleared
+    and the request is rejected with 409 before any scoring happens — the
+    exposure count and response history stay untouched.
     """
     response_key = body.response.strip().upper()
     stored_row: sqlite3.Row | None = None
@@ -532,6 +599,15 @@ def submit_response(
             ).fetchone()
             if session is None:
                 raise HTTPException(status_code=404, detail="session not found")
+            # Deadline first, inside the write lock: finish the session
+            # atomically (pending item cleared), persist that state and reject
+            # with 409.  No exposure is counted and no response row is written.
+            if finish_session_expired(conn, session, datetime.now(timezone.utc)):
+                conn.commit()
+                raise HTTPException(
+                    status_code=409,
+                    detail="测验已超过时限：会话已结束（finish_reason=time_expired）",
+                )
             if session["status"] == "finished":
                 raise HTTPException(status_code=409, detail="测验已结束")
             if session["current_item_id"] != body.item_id:
